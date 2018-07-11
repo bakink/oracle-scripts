@@ -1,9 +1,25 @@
+#!/bin/bash
 # Fred Denis -- denis@pythian.com -- March 2017
-# Automatically generates an Exadata patching action plan
+#
+# Automatically generatesan Exadata patching action plan
 # For more details about the Exadata patching procedure, you can have a look at https://www.pythian.com/blog/patch-exadata-part-1-introduction-prerequisites/
 #
-# The current version of the script is 20180408
+# The current version of the script is 20180702
 #
+# 20180702 - Fred Denis - a -s option to set the database server name if it does not follow the ${CLUSTER_NAME}db01 naming convention
+# 20180524 - Fred Denis - -allow_active_network_mounts appears for the prechecks as well
+#                       - typos
+#                       - remove /tmp/SAVE to avoid leftovers
+#                       - cd /tmp/SAVE/dbserver_patch* instead of the patchmgr version in case we need an upgraded patchmgr version
+#                         (just download the latest patchmgr from bug 21634633 and replace the one that is in <PATH>/Infrastructure/SoftwareMaintenanceTools/DBServerPatch/<VERSION>
+#                          to use another patchmgr than the one shipped with the Bundle)
+#                       - DIR_IB_PATCHING to copy the IB patch outside of any NFS/ZFS to avoid any issue when rebooting the Switches
+#                       - unzip -q instead of nohup unzip
+# 20180518 - Fred Denis - a -w option to choose the GI version when different than cells, IB and DB nodes
+# 20180511 - Fred Denis - Add back ~/ib_group in the IB Switch prereq as the doc saying that ibswitches will be used
+#                          if the file is not specified looks wrong (see 20180404) :
+#                          [root@flccssdrdbadm01 patch_12.2.1.1.7.180506]# ./patchmgr -ibswitches -ibswitch_precheck -upgrade
+#                          [ERROR] Nodes list file must be provided for -ibswitches command line option.
 # 20180408 - Fred Denis - Add the -c option to specify the name of the cel01 if not in the default form ${CLUSTER_NAME}cel01
 #                         Add a scp of the dbs_group file in case of it is not there for the DB nodes pre-reqs / patching
 # 20180404 - Fred Denis - Remove the ib_group file from the ib switch patch command line as patchmgr will find
@@ -27,9 +43,12 @@ DEBUG="No"
                DBSERVER_TYPE="OL"                                       # Other possible value is OVS
                STATUS_SCRIPT=/home/oracle/pythian/rac-status.sh         # Where the status script is located (this one : https://raw.githubusercontent.com/freddenis/oracle-scripts/master/status.sh)
               VER_TO_INSTALL="."                                        # If no version to install specified, we want to install the highest
+                  GI_VERSION=""                                         # GI version to install
             MODIFY_AT_PREREQ=""                                         # No "-modify_at_prereq" by default
             ALLOW_ACTIVE_NFS="Yes"                                      # To use the -allow_active_network_mounts option (available starting from version 12.1.2.1.1)
-                       CEL01=""                                         # Name of the Cell 01 we will be using to patch the DB Nodes
+                       CEL01=""                                         # Name of the Cell 01 we will be using to patch the DB Nodes (can be modify using the -c option)
+			DB01=""						# Name of the DB Server 01 we will be using to patch the DB Nodes (can be modify using the -s option)
+             DIR_IB_PATCHING="/tmp/IB_PATCHING"                         # Directory to copy the IB Switch outside of NFS/ZFS to avoid issues when rebooting the IB Switches
 
 #
 # A usage function
@@ -43,10 +62,12 @@ usage()
                 -f                                                      (optional) Generate the commands to force umount the NFS before patching (for versions < 12.1.2.1.1)
                 -g <GI_HOME>                                            (optional)
                 -c <Cel01 name>                                         (optional -- if your cel01 is not named in the form ${CLUSTER_NAME}cel01)
+		-s <DB01 name>						(optional -- if your db01  is not named in the form ${CLUSTER_NAME}db01)
                 -h                                                      (generate a HTML action plan, mandatory, default is no HTML)
                 -n <NAME_OF_THE_CLUSTER>                                (optional)
                 -u                                                      (Unzip and prereqs steps have been done, shows a green "DONE" for the unzip parts, default is unzip has not been done)
                 -v <Cells, IB and DB Server version to install>         (optional -- default is the highest)
+                -w <GI version to install>                              (optional -- same as cells and DB nodes if not specified)
 
                 # Use the below -[mM] options with caution
                 -m                                                      (optional -- use the -modify_at_prereq option when patching the DB Servers; default is -modify_at_prereq is not used)
@@ -57,16 +78,18 @@ usage()
 #
 # Parameters management
 #
-while getopts ":d:n:humMg:v:fc:" OPT; do
+while getopts ":d:n:humMg:v:fc:s:w:" OPT; do
         case ${OPT} in
         d)          PATCH_DIR=`echo ${OPTARG} | sed s'/\/ *$//'`    ;;      # Remove any trailing /
         f)   ALLOW_ACTIVE_NFS="No"                                  ;;
         g)            GI_HOME=`echo ${OPTARG} | sed s'/\/ *$//'`    ;;      # Remove any trailing /
         c)             CEL01=${OPTARG}                              ;;
+        s)              DB01=${OPTARG}                              ;;
         h)               HTML="Yes"                                 ;;
         n)       CLUSTER_NAME=${OPTARG}                             ;;
         u)         UNZIP_DONE="Yes"                                 ;;
         v)     VER_TO_INSTALL=${OPTARG}                             ;;      # Cells, IB and DB Server version to install
+        w)         GI_VERSION=${OPTARG}                             ;;      # Version for GI
         m|M) MODIFY_AT_PREREQ="-modify_at_prereq"                   ;;
         \?) echo "Invalid option: -$OPTARG" >&2; usage              ;;
         esac
@@ -89,9 +112,13 @@ then
                 CLUSTER_NAME=${DEFAULT_CLUSTER_NAME}
         fi
 fi
-if [ -z ${CEL01} ]              # Build te default cel01 name if not specified from the command line
+if [ -z ${CEL01} ]              # Build the default cel01 name if not specified from the command line (-c option)
 then
         CEL01=${CLUSTER_NAME}cel01
+fi
+if [ -z ${DB01} ]		# Build the default db01 name if not specified from the command line (-s option)
+then
+        DB01=${CLUSTER_NAME}db01
 fi
 if [ -z ${GI_HOME} ]            # If Grid Home is not set, we try to find out, if not we put a default
 then
@@ -101,6 +128,13 @@ then
                 GI_HOME=${DEFAULT_GI_HOME}
         fi
 fi
+if [ "${ALLOW_ACTIVE_NFS}" = "No" ]
+then
+        ALLOW_ACTIVE_NFS_OPTION=""
+else
+        ALLOW_ACTIVE_NFS_OPTION="-allow_active_network_mounts"
+fi
+
 
 #
 # Grep and format the information we need from the bundle.xml file
@@ -277,16 +311,20 @@ fi
               PATCHMGR=`grep "^PATCHMGR"  ${CONF}                                                                       | awk 'BEGIN{FS="|"} {print $2}'`
           PATCHMGR_ZIP=`grep "^PATCHMGR"  ${CONF}                                                                       | awk 'BEGIN{FS="|"} {print $3}'`
                 OPATCH=`grep "^OPATCH"    ${CONF}                                                                       | awk 'BEGIN{FS="|"} {print $2}'`
-                GI_DIR=`grep "^GI"        ${CONF} | grep ${VERSION}                                                     | awk 'BEGIN{FS="|"} {print $2}'`               # I take the latest version for the GI
-              GI_PATCH=`grep "^GI"        ${CONF} | grep ${VERSION}                                                     | awk 'BEGIN{FS="|"} {print $3}'`               # I take the latest version for the GI
+        if [ -z ${GI_VERSION} ]
+        then
+                GI_VERSION=${VER_TO_INSTALL}
+        fi
+                GI_DIR=`grep "^GI"        ${CONF} | grep ${GI_VERSION}                                                  | awk 'BEGIN{FS="|"} {print $2}'`
+              GI_PATCH=`grep "^GI"        ${CONF} | grep ${GI_VERSION}                                                  | awk 'BEGIN{FS="|"} {print $3}'`
              GI_BUNDLE=${PATCH_DIR}/${GI_DIR}/${GI_PATCH}/bundle.xml
 
 #
 # Define some prompts to put in the action plan
 #
-         DBROOTPROMPT="[root@${CLUSTER_NAME}db01 ~]#"
+         DBROOTPROMPT="[root@${DB01} ~]#"
         CELROOTPROMPT="[root@${CEL01} ~]#"
-       DBORACLEPROMPT="[oracle@${CLUSTER_NAME}db01 ~]$"
+       DBORACLEPROMPT="[oracle@${DB01} ~]$"
 
 #
 # Show debug info (check the DEBUG variable on top of this script if you want / don't want these debug information)
@@ -368,7 +406,7 @@ ${S_H3}1.1/ First of all, you need to unzip the ${CELL_AND_IB_ZIP} file${U_DONE}
 
 ${S_PRE}
 ${TAB} ${DBROOTPROMPT} ${S_B} cd ${PATCH_DIR}/${CELL_AND_IB}                                                                                    ${E_B}
-${TAB} ${DBROOTPROMPT} ${S_B} nohup unzip `basename ${CELL_AND_IB_ZIP}` &                                                                       ${E_B}
+${TAB} ${DBROOTPROMPT} ${S_B} unzip -q `basename ${CELL_AND_IB_ZIP}`                                                                            ${E_B}
 
 ${TAB} -- This should create a ${S_B} patch_${TARGET_VERSION} ${E_B} directory with the cell patch
 ${E_PRE}
@@ -395,41 +433,48 @@ ${E_PRE}
 ${S_H2}2/ InfiniBand Switches patching ${E_H2}
 
 ${S_H3}2.1 / IB Switches prerequisites${U_DONE}:${E_H3}
-
+- To avoid issues with NFS/ZFS when rebooting the IB Switches, I recommend copying the patch outside of any NFS/ZFS
+- This patch is ~ 2.5 GB so be careful not to fill / if you copy it into /tmp, if not choose another local FS
 ${S_PRE}
-${TAB} ${DBROOTPROMPT} ${S_B} cd ${PATCH_DIR}/${CELL_AND_IB}/patch_${TARGET_VERSION}                                                            ${E_B}
-${TAB} ${DBROOTPROMPT} ${S_B} ./patchmgr -ibswitches -ibswitch_precheck -upgrade                                                                ${E_B}
+${TAB} ${DBROOTPROMPT} ${S_B} df -h ${DIR_IB_PATCHING}                                                                                          ${E_B}
+${TAB} ${DBROOTPROMPT} ${S_B} rm -r ${DIR_IB_PATCHING}                                                                                          ${E_B}
+${TAB} ${DBROOTPROMPT} ${S_B} mkdir ${DIR_IB_PATCHING}                                                                                          ${E_B}
+${TAB} ${DBROOTPROMPT} ${S_B} unzip -q ${PATCH_DIR}/${CELL_AND_IB}/${CELL_AND_IB_ZIP} -d /tmp/IB_PATCHING                                       ${E_B}
+${TAB} ${DBROOTPROMPT} ${S_B} cd ${DIR_IB_PATCHING}/patch_${TARGET_VERSION}                                                                     ${E_B}
+${TAB} ${DBROOTPROMPT} ${S_B} ./patchmgr -ibswitches ~/ib_group -ibswitch_precheck -upgrade                                                     ${E_B}
 ${E_PRE}
 
 ${S_H3}2.2 / Apply the patch on the IB Switches:${E_H3}
 
 ${S_PRE}
 ${TAB} ${DBROOTPROMPT} ${S_B} dcli -g ~/ib_group -l root version                                                                                ${E_B}
-${TAB} ${DBROOTPROMPT} ${S_B} cd ${PATCH_DIR}/${CELL_AND_IB}/patch_${TARGET_VERSION}                                                            ${E_B}
+${TAB} ${DBROOTPROMPT} ${S_B} cd ${DIR_IB_PATCHING}/patch_${TARGET_VERSION}                                                                     ${E_B}
 ${TAB} ${DBROOTPROMPT} ${S_B} ./patchmgr -ibswitches ~/ib_group -ibswitch_precheck -upgrade                                                     ${E_B}
 ${TAB} ${DBROOTPROMPT} ${S_B} nohup ./patchmgr -ibswitches ~/ib_group -upgrade &                                                                ${E_B}
 ${TAB} ${DBROOTPROMPT} ${S_B} dcli -g ~/ib_group -l root version                                                                                ${E_B}
+${TAB} ${DBROOTPROMPT} ${S_B} rm -r ${DIR_IB_PATCHING}                                                                                          ${E_B}
 ${E_PRE}
 
 ${S_H2}3/ Database Servers patching ${E_H2}
 
 - As we cannot patch a node we are connected to, we will start the patch from a cell server (${CEL01}). To be able to do that, we need to copy patchmgr and the ISO file on this cell server. Do NOT unzip the ISO file, patchmgr will take care of it.
--- Use the script ${S_B}${STATUS_SCRIPT}${E_B} to monitore the instances during the patch application
+-- Use the script ${S_B}${STATUS_SCRIPT}${E_B} to monitor the instances during the patch application
 
 ${S_H3}3.1/ Copy what is needed to ${CEL01}:${E_H3}
 
 -- Create a ${S_B}/tmp/SAVE${E_B} directory in order to avoid the automatic maintenance jobs that purge /tmp every day (directories > 5 MB and older than 1 day). If not, these maintenance jobs will delete the dbnodeupdate.zip file that is mandatory to apply the patch -- this won't survive a reboot though
 
 ${S_PRE}
+${TAB} ${DBROOTPROMPT} ${S_B} ssh root@${CEL01} rm -r /tmp/SAVE                                                                                 ${E_B}
 ${TAB} ${DBROOTPROMPT} ${S_B} ssh root@${CEL01} mkdir /tmp/SAVE                                                                                 ${E_B}
 ${TAB} ${DBROOTPROMPT} ${S_B} scp ${PATCH_DIR}/${PATCHMGR}/${PATCHMGR_ZIP} root@${CEL01}:/tmp/SAVE/.                                            ${E_B}
 ${TAB} ${DBROOTPROMPT} ${S_B} scp ${PATCH_DIR}/${OL6_DIR}/${ISO} root@${CEL01}:/tmp/SAVE/.                                                      ${E_B}
 ${TAB} ${DBROOTPROMPT} ${S_B} scp ~/dbs_group root@${CEL01}:~/.                                                                                 ${E_B}
 ${TAB} ${DBROOTPROMPT} ${S_B} ssh root@${CEL01}                                                                                                 ${E_B}
 ${TAB} ${CELROOTPROMPT} ${S_B} cd /tmp/SAVE                                                                                                     ${E_B}
-${TAB} ${CELROOTPROMPT} ${S_B} nohup unzip ${PATCHMGR_ZIP} &                                                                                    ${E_B}
+${TAB} ${CELROOTPROMPT} ${S_B} unzip -q ${PATCHMGR_ZIP}                                                                                         ${E_B}
 
-${TAB} This should create a ${S_B} dbserver_patch_`basename ${PATCHMGR}` ${E_B} directory
+${TAB} This should create a ${S_B} dbserver_patch_`basename ${PATCHMGR}` ${E_B} directory (the name may be slightly different if you use a different patchmgr than the one shipped with the Bundle)
 ${E_PRE}
 
 ${S_H3}3.2/ Do the prerequisites${U_DONE}:${E_H3}
@@ -437,8 +482,8 @@ ${S_H3}3.2/ Do the prerequisites${U_DONE}:${E_H3}
 -- Consider using the ${S_B}-modify_at_prereq${E_B} option ${S_B}with extra caution${E_B} if you face some dependencies issues (-m or -M option of the action plan generator script)
 
 ${S_PRE}
-${TAB} ${CELROOTPROMPT} ${S_B} cd /tmp/SAVE/dbserver_patch_`basename ${PATCHMGR}`                                                               ${E_B}
-${TAB} ${CELROOTPROMPT} ${S_B} ./patchmgr -dbnodes ~/dbs_group -precheck ${MODIFY_AT_PREREQ} -iso_repo /tmp/SAVE/${ISO} -target_version ${TARGET_VERSION} ${E_B}
+${TAB} ${CELROOTPROMPT} ${S_B} cd /tmp/SAVE/dbserver_patch_*                                                                                    ${E_B}
+${TAB} ${CELROOTPROMPT} ${S_B} ./patchmgr -dbnodes ~/dbs_group -precheck ${MODIFY_AT_PREREQ} -iso_repo /tmp/SAVE/${ISO} -target_version ${TARGET_VERSION} ${ALLOW_ACTIVE_NFS_OPTION} ${E_B}
 ${E_PRE}
 
 -- You can safely ignore the below warning (this is a patchmgr bug for a while) if the GI version is > 11.2.0.2 -- which is most likely the case
@@ -448,22 +493,19 @@ ${E_PRE}
 
 ${S_H3}3.3/ We can now proceed with the rolling patch on the database servers:${E_H3}
 
--- ${S_B}Direct connect to the ${CEL01} server${E_B}, if you go through ${CLUSTER_NAME}db01 or another database server, you will lose your connection when it will be rebooted
+-- ${S_B}Direct connect to the ${CEL01} server${E_B}, if you go through ${DB01} or another database server, you will lose your connection when it will be rebooted
 "
 
 if [ "${ALLOW_ACTIVE_NFS}" = "No" ]
 then
-        ALLOW_ACTIVE_NFS_OPTION=""
 echo -e "-- Before applying the patch, we first need to umount the NFS on all the database servers:${E_H3}
  - The below command will generate the umount command; add \"${S_B}| bash${E_B}\" at the and and it will umount everything automatically
  - If something prevents a NFS to umount, you can check what it is with \"${S_B}lsof FS_NAME${E_B}\" or \"${S_B}fuser -c -u FS_NAME${E_B}\" and kill it with \"${S_B}fuser -c -k FS_NAME${E_B}\"
  - Nothing should prevent ${S_B}umount -l${E_B} to work
 ${S_PRE}
-${TAB} ${DBROOTPROMPT} ${S_B} df -t nfs | awk '{if (\$NF ~ /^\//){print \"umount -l \" \$NF}}'                                         ${E_B}
+${TAB} ${DBROOTPROMPT} ${S_B} df -t nfs | awk '{if (\$NF ~ /^\//){print \"umount -l \" \$NF}}'                                                  ${E_B}
 ${E_PRE}
 ${TAB} Note : You may consider using the ${S_B}-allow_active_network_mounts${E_B} option if your source version is > 12.1.2.1.1 (default)"
-else
-        ALLOW_ACTIVE_NFS_OPTION="-allow_active_network_mounts"
 fi
 
 
@@ -471,13 +513,13 @@ echo -e "
 -- Apply the patch
 ${S_PRE}
 ${TAB} ${CELROOTPROMPT} ${S_B} dcli -g ~/dbs_group -l root imageinfo -ver                                                                       ${E_B}
-${TAB} ${CELROOTPROMPT} ${S_B} cd /tmp/SAVE/dbserver_patch_`basename ${PATCHMGR}`                                                               ${E_B}
-${TAB} ${CELROOTPROMPT} ${S_B} ./patchmgr -dbnodes ~/dbs_group -precheck ${MODIFY_AT_PREREQ} -iso_repo /tmp/SAVE/${ISO} -target_version ${TARGET_VERSION} ${E_B}
-${TAB} ${CELROOTPROMPT} ${S_B} nohup ./patchmgr -dbnodes ~/dbs_group -upgrade -iso_repo /tmp/SAVE/${ISO} -target_version ${TARGET_VERSION} ${ALLOW_ACTIVE_NFS_OPTION} -rolling & ${E_B}
+${TAB} ${CELROOTPROMPT} ${S_B} cd /tmp/SAVE/dbserver_patch_*                                                                                    ${E_B}
+${TAB} ${CELROOTPROMPT} ${S_B} ./patchmgr -dbnodes ~/dbs_group -precheck ${MODIFY_AT_PREREQ} -iso_repo /tmp/SAVE/${ISO} -target_version ${TARGET_VERSION} ${ALLOW_ACTIVE_NFS_OPTION}    ${E_B}
+${TAB} ${CELROOTPROMPT} ${S_B} nohup ./patchmgr -dbnodes ~/dbs_group -upgrade -iso_repo /tmp/SAVE/${ISO} -target_version ${TARGET_VERSION} ${ALLOW_ACTIVE_NFS_OPTION} -rolling &        ${E_B}
 
 ${TAB} Note : the ${S_B}${ALLOW_ACTIVE_NFS_OPTION}${E_B} option is available starting from 12.1.2.1.1, please regenerate the action plan using the ${S_B}-f${E_B} option if you run a version < 12.1.2.1.1
 
--- You can monitore the patch looking at the nohup.out file (tail -f nohup.out) or the patchmgr.out file
+-- You can monitor the patch looking at the nohup.out file (tail -f nohup.out) or the patchmgr.out file
 
 ${TAB} ${CELROOTPROMPT} ${S_B} dcli -g ~/dbs_group -l root imageinfo -ver                                                                       ${E_B}
 ${E_PRE}
@@ -489,7 +531,7 @@ ${S_H3}4.1/ To start with, be sure that the patch has been unzipped (as oracle u
 
 ${S_PRE}
 ${TAB} ${DBORACLEPROMPT} ${S_B} cd ${PATCH_DIR}/${GI_DIR}                                                                                       ${E_B}
-${TAB} ${DBORACLEPROMPT} ${S_B} nohup unzip  p${GI_PATCH}*_Linux-x86-64.zip &                                                                   ${E_B}
+${TAB} ${DBORACLEPROMPT} ${S_B} unzip -q p${GI_PATCH}*_Linux-x86-64.zip                                                                         ${E_B}
 ${TAB} -- This should create a ${S_B} ${GI_PATCH} ${E_B} directory.
 ${E_PRE}
 
@@ -507,9 +549,9 @@ ${TAB} ${DBROOTPROMPT} ${S_B} cd ${PATCH_DIR}/${GI_DIR}/${GI_PATCH}             
 ${TAB} ${DBROOTPROMPT} ${S_B} ${GI_HOME}/OPatch/opatchauto apply -oh ${GI_HOME} -analyze                                                        ${E_B}
 ${E_PRE}
 
-${S_H3}4.2/ Apply the patch ${S_B}on each node one after the other (${CLUSTER_NAME}db01 then (${CLUSTER_NAME}db02, etc...)${E_B}:${E_H3}
+${S_H3}4.2/ Apply the patch ${S_B}on each node one after the other (${DB01} then the next node, etc...)${E_B}:${E_H3}
 
--- Use the script ${S_B}${STATUS_SCRIPT}${E_B} to monitore the instances during the patch application
+-- Use the script ${S_B}${STATUS_SCRIPT}${E_B} to monitor the instances during the patch application
 ${S_PRE}
 ${TAB} -- Check the inventory before the patch
 ${TAB} ${DBORACLEPROMPT} ${S_B} . oraenv <<< \`grep \"^+ASM\" /etc/oratab | awk -F \":\" '{print \$1}'\`                                        ${E_B}
@@ -553,5 +595,3 @@ ${E_PRE}
 #************************************************************************************************#
 #*                              E N D      O F      S O U R C E                                 *#
 #************************************************************************************************#
-
-
