@@ -6,8 +6,10 @@
 #
 # Please have a look at https://goo.gl/wv2z5m for more information on this script
 #
-# The current version of the script is 20190128
+# The current version of the script is 20190222
 #
+# 20190222 - Fred Denis - Option -s to not show the empty U slots
+#			  Option -f to specify a non default databasemachine.xml file
 # 20190128 - Fred Denis - Added PDUs
 # 20190126 - Fred Denis - Some dbmachine files may not have the info in the same order -- fixed this
 # 20190125 - Fred Denis - Moved Blue to Lightblue and Red to Lightred to have a more pastel output
@@ -15,9 +17,60 @@
 #
 
 #
+# Variables
+#
+SHOW_EMPTY_U="YES"              # Set SHOW_EMPTY_U="NO" here to always not show the empty U by default
+          IN=""			# If a file is specified with the -f option
+
+
+#
+# Function usage
+#
+usage()
+{
+printf "\033[1;37m%-8s\033[m\n" "NAME"                ;
+cat << END
+        `basename $0` - Show an Exadata Rack Layout based on the databasemachine.xml file
+END
+
+printf "\n\033[1;37m%-8s\033[m\n" "SYNOPSIS"            ;
+cat << END
+        $0 [-f] [-s] [-h]
+END
+
+printf "\n\033[1;37m%-8s\033[m\n" "OPTIONS"             ;
+cat << END
+	-f	Specify a non default databasemachine.xml file
+			$0 -f /tmp/mydatabasemachine.xml
+        -s      Show a short form of the Rack Layout by hiding the empty U slots
+                You can set SHOW_EMPTY_U="NO" on top of the script to always show the short form
+        -h      Show this help
+END
+printf "\n"
+exit 123
+}
+
+#
+# Options management
+#
+while getopts "shf:" OPT; do
+        case ${OPT} in
+        s)         SHOW_EMPTY_U="NO"                                                   ;;
+	f)	             IN=${OPTARG}					       ;;
+        h)         usage                                                               ;;
+        \?)        echo "Invalid option: -$OPTARG" >&2; usage                          ;;
+        esac
+done
+
+#
 # The databasemachine.xml file we base our report on
 #
-DBMACHINE=/opt/oracle.SupportTools/onecommand/databasemachine.xml
+if [[ -z "${IN}" ]]
+then
+	DBMACHINE=/opt/oracle.SupportTools/onecommand/databasemachine.xml
+else
+	DBMACHINE=${IN}
+fi
 
 if [ ! -f ${DBMACHINE} ] || [ ! -r ${DBMACHINE} ]
 then
@@ -28,7 +81,7 @@ then
 fi
 printf "\n"
 
-awk 'BEGIN\
+awk -v SHOW_EMPTY_U="$SHOW_EMPTY_U" 'BEGIN\
         {       FS="<|>"                                                                ;
                 # some colors
              COLOR_BEGIN =       "\033[1;"                                              ;
@@ -83,7 +136,6 @@ awk 'BEGIN\
                                 if ($2 == "ILOMNAME")           {  ILOMNAME=$3  ; if (length($3) > MAX_COL3) {MAX_COL3 = length($3)}}
                                 if ($2 == "ILOMIP")             {    ILOMIP=$3  ; if (length($3) > MAX_COL4) {MAX_COL4 = length($3)}}
                                 if ($2 == "ULOCATION")          {ULOC=$3        ;}
-                                #if ($2 == "/ITEM")              {tab[ULOC]=TYPE";"ADMINNAME";"ADMINIP";"ILOMNAME";"ILOMIP ;break  ;       }
                                 if ($2 == "/ITEM")              {       if (TYPE == "pdu")
                                                                         {       if (tab[ULOC] == "")
                                                                                 {       tab[ULOC]=TYPE";"ADMINNAME";"ADMINIP;
@@ -136,23 +188,26 @@ awk 'BEGIN\
                                         if (temp[2] != "") {color=RED}                  ;
                                 }
                         }
-
-                        printf(COLOR_BEGIN color "%s", "")                              ;
-                        printf(" %-"COL_U"s|", ui);                                     ;       # U
-                        printf(" %-"MAX_COL1"s|", to_print[2])                          ;       # Hostname
-                        printf(" %-"MAX_COL2"s|", to_print[3])                          ;       # Host IP
-                        if ((to_print[1] ~ /node/) || (to_print[1] == "pdu"))
-                        {
-                                to_print_col3 = to_print[4]                             ;
-                                to_print_col4 = to_print[5]                             ;
-                        } else {
-                                to_print_col3 = ""                                      ;
-                                to_print_col4 = ""                                      ;
-                        }
-                        printf(" %-"MAX_COL3"s|", to_print_col3)                        ;       # ILOM name
-                        printf(" %-"MAX_COL4"s|", to_print_col4)                        ;       # ILOM IP
-                        printf(COLOR_END "%s", "")                                      ;
-                        printf "\n"                                                     ;
+			#if ((to_print[2] != "") || (toupper(SHOW_EMPTY_U) == "YES"))
+                        if ((to_print[2] != "") || (toupper(SHOW_EMPTY_U) == "YES") || ((temp[2] != "") && (tab[i-1] ~ /cellnode/)))
+			{
+                           printf(COLOR_BEGIN color "%s", "")                           ;
+                           printf(" %-"COL_U"s|", ui);                                  ;       # U
+                           printf(" %-"MAX_COL1"s|", to_print[2])                       ;       # Hostname
+                           printf(" %-"MAX_COL2"s|", to_print[3])                       ;       # Host IP
+                           if ((to_print[1] ~ /node/) || (to_print[1] == "pdu"))
+                           {
+                                   to_print_col3 = to_print[4]                          ;
+                                   to_print_col4 = to_print[5]                          ;
+                           } else {
+                                   to_print_col3 = ""                                   ;
+                                   to_print_col4 = ""                                   ;
+                           }
+                           printf(" %-"MAX_COL3"s|", to_print_col3)                     ;       # ILOM name
+                           printf(" %-"MAX_COL4"s|", to_print_col4)                     ;       # ILOM IP
+                           printf(COLOR_END "%s", "")                                   ;
+                           printf "\n"                                                  ;
+			}
                 }
                 print_a_line(line_size)                                                 ;
                 printf "\n"                                                             ;
